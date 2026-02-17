@@ -1,4 +1,4 @@
-// memory_core_cli.c
+// memory_core_cli.c (updated: supports --retention-minutes)
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,21 +117,13 @@ static scan_entry_t *collect_scan_dirs(const char *base_dir, size_t *entries_cou
     scan_entry_t *arr = NULL;
     size_t cap = 0, cnt = 0;
 
-    /* walk base_dir recursively */
-    DIR *d = opendir(base_dir);
-    if (!d) { *entries_count = 0; return NULL; }
-
-    struct dirent *e;
-    char path[PATH_MAX];
-
     /* stack for directories to traverse */
-    typedef struct {
-        char *dpath;
-    } stack_item;
+    typedef struct { char *dpath; } stack_item;
     stack_item *stack = NULL;
     size_t stack_cap = 0, stack_cnt = 0;
 
-    /* push base_dir */
+    if (access(base_dir, F_OK) != 0) { *entries_count = 0; return NULL; }
+
     stack_cap = 16;
     stack = xmalloc(stack_cap * sizeof(stack_item));
     stack[stack_cnt++].dpath = xstrdup(base_dir);
@@ -140,31 +132,29 @@ static scan_entry_t *collect_scan_dirs(const char *base_dir, size_t *entries_cou
         char *cur = stack[--stack_cnt].dpath;
         DIR *cd = opendir(cur);
         if (!cd) { free(cur); continue; }
+        struct dirent *e;
+        char path[PATH_MAX];
         while ((e = readdir(cd)) != NULL) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
             snprintf(path, sizeof(path), "%s/%s", cur, e->d_name);
             struct stat st;
             if (lstat(path, &st) == -1) continue;
             if (S_ISDIR(st.st_mode)) {
-                /* push directory */
                 if (stack_cnt == stack_cap) {
                     stack_cap *= 2;
                     stack = realloc(stack, stack_cap * sizeof(stack_item));
                     if (!stack) { perror("realloc"); exit(1); }
                 }
                 stack[stack_cnt++].dpath = xstrdup(path);
-            } else {
-                /* check for metadata.json or normalized.json in this directory by looking up */
             }
         }
         closedir(cd);
 
-        /* Now check if cur contains metadata.json or normalized.json */
+        /* check for metadata.json or normalized.json in this directory */
         char meta_path[PATH_MAX];
         snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", cur);
         struct stat mst;
         if (stat(meta_path, &mst) == 0) {
-            /* found a scan dir */
             if (cnt == cap) {
                 cap = (cap == 0) ? 64 : cap * 2;
                 arr = realloc(arr, cap * sizeof(scan_entry_t));
@@ -174,7 +164,6 @@ static scan_entry_t *collect_scan_dirs(const char *base_dir, size_t *entries_cou
             arr[cnt].mtime = mst.st_mtime;
             cnt++;
         } else {
-            /* also accept presence of normalized.json */
             char norm_path[PATH_MAX];
             snprintf(norm_path, sizeof(norm_path), "%s/normalized.json", cur);
             if (stat(norm_path, &mst) == 0) {
@@ -209,10 +198,10 @@ static int cmp_scan_entry(const void *a, const void *b) {
 }
 
 /* Perform retention cleanup:
-   - Delete entries older than retention_days (if retention_days > 0)
+   - Delete entries older than retention_seconds (if retention_seconds > 0)
    - Enforce max_scans (if max_scans > 0)
 */
-static void perform_retention(const char *base_dir, int retention_days, int max_scans) {
+static void perform_retention(const char *base_dir, long retention_seconds, int max_scans) {
     size_t cnt = 0;
     scan_entry_t *entries = collect_scan_dirs(base_dir, &cnt);
     if (!entries || cnt == 0) {
@@ -223,18 +212,15 @@ static void perform_retention(const char *base_dir, int retention_days, int max_
     qsort(entries, cnt, sizeof(scan_entry_t), cmp_scan_entry);
 
     time_t now = time(NULL);
-    ssize_t removed = 0;
 
-    if (retention_days > 0) {
-        time_t cutoff = now - (time_t)retention_days * 86400L;
+    if (retention_seconds > 0) {
+        time_t cutoff = now - retention_seconds;
         for (size_t i = 0; i < cnt; ++i) {
             if (entries[i].mtime < cutoff) {
                 rm_rf(entries[i].path);
-                removed++;
                 free(entries[i].path);
                 entries[i].path = NULL;
             } else {
-                /* since sorted ascending, once we hit >= cutoff, break */
                 break;
             }
         }
@@ -255,11 +241,9 @@ static void perform_retention(const char *base_dir, int retention_days, int max_
             rm_rf(entries[i].path);
             free(entries[i].path);
             entries[i].path = NULL;
-            removed++;
         }
     }
 
-    /* free remaining */
     for (size_t i = 0; i < cnt; ++i) {
         if (entries[i].path) free(entries[i].path);
     }
@@ -269,7 +253,8 @@ static void perform_retention(const char *base_dir, int retention_days, int max_
 /* Minimal argument parsing */
 static void print_usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s [--host HOST] [--type TYPE] [--severity N] [--base-dir DIR] [--retention-days N] [--max-scans N]\n",
+        "Usage: %s [--host HOST] [--type TYPE] [--severity N] [--base-dir DIR]\n"
+        "       [--retention-days N] [--retention-minutes N] [--max-scans N]\n",
         prog);
 }
 
@@ -280,7 +265,7 @@ int main(int argc, char **argv) {
     int severity = 0;
     char base_dir[PATH_MAX];
     strncpy(base_dir, DEFAULT_BASE_DIR, sizeof(base_dir));
-    int retention_days = DEFAULT_RETENTION_DAYS;
+    long retention_seconds = (long)DEFAULT_RETENTION_DAYS * 86400L;
     int max_scans = DEFAULT_MAX_SCANS;
 
     for (int i = 1; i < argc; ++i) {
@@ -288,7 +273,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--type") && i + 1 < argc) { scan_type = argv[++i]; }
         else if (!strcmp(argv[i], "--severity") && i + 1 < argc) { severity = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--base-dir") && i + 1 < argc) { strncpy(base_dir, argv[++i], sizeof(base_dir)-1); base_dir[sizeof(base_dir)-1]=0; }
-        else if (!strcmp(argv[i], "--retention-days") && i + 1 < argc) { retention_days = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--retention-days") && i + 1 < argc) {
+            int d = atoi(argv[++i]);
+            retention_seconds = (long)d * 86400L;
+        }
+        else if (!strcmp(argv[i], "--retention-minutes") && i + 1 < argc) {
+            int m = atoi(argv[++i]);
+            retention_seconds = (long)m * 60L;
+        }
         else if (!strcmp(argv[i], "--max-scans") && i + 1 < argc) { max_scans = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--help")) { print_usage(argv[0]); return 0; }
         else { print_usage(argv[0]); return 1; }
@@ -363,8 +355,8 @@ int main(int argc, char **argv) {
     free(hash);
     free(stdin_buf);
 
-    /* perform retention cleanup */
-    perform_retention(base_dir, retention_days, max_scans);
+    /* perform retention cleanup using seconds */
+    perform_retention(base_dir, retention_seconds, max_scans);
 
     return 0;
 }
